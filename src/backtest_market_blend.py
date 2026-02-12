@@ -9,33 +9,22 @@ def american_to_decimal(ml: float) -> float:
     else:
         return 1.0 + (100.0 / (-ml))
 
-def profit_per_unit_stake_from_decimal(dec: float) -> float:
-    # stake 1 unit; win profit = dec-1; lose = -1
-    return dec - 1.0
+def ev_per_1u(p: float, dec: float) -> float:
+    # stake 1 unit, win profit = dec-1, lose = -1
+    return p * (dec - 1.0) - (1.0 - p)
 
-def kelly_fraction(p: float, dec: float) -> float:
-    # f* = (bp - q)/b where b=dec-1, q=1-p
-    b = dec - 1.0
-    if b <= 0:
-        return 0.0
-    q = 1.0 - p
-    f = (b * p - q) / b
-    return max(0.0, f)
+def pnl_per_1u(win: int, dec: float) -> float:
+    return (dec - 1.0) if win == 1 else -1.0
 
-# ---------- main ----------
 if __name__ == "__main__":
-    # ---- Inputs ----
-    PRED_PATH = "data/processed/preds_with_market.csv"
+    PRED_PATH = "data/processed/preds_with_market.csv"   # <- your current file
     ODDS_PATH = "data/raw/odds_snapshots.parquet"
     GAMES_PATH = "data/processed/games.parquet"
 
-    EDGE_THRESHOLD = 0.04          # only bet if p_final - p_market >= this
-    MIN_KELLY = 0.0                # floor
-    MAX_KELLY = 0.05               # cap per bet (5% bankroll)
-    KELLY_MULT = 0.25              # quarter-kelly (safer)
-    START_BANKROLL = 100.0
+    # Filters
+    MIN_EV = 0.02          # +0.02 = +2% expected value per 1u stake (reasonable)
+    PRINT_TOP = 15         # show top opportunities by EV even if no results yet
 
-    # ---- Load ----
     preds = pd.read_csv(PRED_PATH)
     odds = pd.read_parquet(ODDS_PATH)
     games = pd.read_parquet(GAMES_PATH)
@@ -44,14 +33,7 @@ if __name__ == "__main__":
     preds["date"] = pd.to_datetime(preds["date"]).dt.date.astype(str)
     games["GAME_DATE"] = pd.to_datetime(games["GAME_DATE"]).dt.date.astype(str)
 
-    # Ensure abbreviations exist in games table
-    # Your games.parquet columns (from earlier): TEAM_ABBREVIATION_HOME/AWAY, HOME_WIN
-    needed_cols = {"GAME_DATE", "TEAM_ABBREVIATION_HOME", "TEAM_ABBREVIATION_AWAY", "HOME_WIN"}
-    missing = needed_cols - set(games.columns)
-    if missing:
-        raise ValueError(f"games.parquet missing columns: {missing}")
-
-    # Keep latest snapshot per (game_date, home_abbr, away_abbr) (acts like “closest to now”)
+    # Odds: keep latest snapshot per matchup/date
     odds = odds.copy()
     odds["snapshot_utc"] = pd.to_datetime(odds["snapshot_utc"], errors="coerce")
     odds["game_date"] = pd.to_datetime(odds["game_date"]).dt.date.astype(str)
@@ -61,7 +43,7 @@ if __name__ == "__main__":
         keep="last"
     )
 
-    # Join preds -> odds (to get moneylines)
+    # Join preds -> odds by exact date
     df = preds.merge(
         odds[["game_date", "home_abbr", "away_abbr", "ml_home", "ml_away", "p_home_mkt"]],
         left_on=["date", "home", "away"],
@@ -69,21 +51,19 @@ if __name__ == "__main__":
         how="left"
     )
 
-    # If UTC date mismatch happened in your logs, try tomorrow match fallback:
-    # (This catches the common “local date vs UTC date” issue.)
+    # Fallback: match odds by date+1 (UTC rollover)
     missing_odds = df["ml_home"].isna()
     if missing_odds.any():
-        df2 = preds.copy()
-        df2["date_plus1"] = (pd.to_datetime(df2["date"]) + pd.Timedelta(days=1)).dt.date.astype(str)
-        df2 = df2.merge(
+        preds2 = preds.copy()
+        preds2["date_plus1"] = (pd.to_datetime(preds2["date"]) + pd.Timedelta(days=1)).dt.date.astype(str)
+        df_fb = preds2.merge(
             odds[["game_date", "home_abbr", "away_abbr", "ml_home", "ml_away", "p_home_mkt"]],
             left_on=["date_plus1", "home", "away"],
             right_on=["game_date", "home_abbr", "away_abbr"],
             how="left"
         )
-        # fill missing from fallback
-        for c in ["ml_home", "ml_away", "p_home_mkt", "game_date"]:
-            df.loc[missing_odds, c] = df2.loc[missing_odds, c].values
+        for c in ["ml_home", "ml_away", "p_home_mkt"]:
+            df.loc[missing_odds, c] = df_fb.loc[missing_odds, c].values
 
     # Join to results
     df = df.merge(
@@ -93,99 +73,88 @@ if __name__ == "__main__":
         how="left"
     )
 
-    # Keep only rows with actual results + odds
-    df = df.dropna(subset=["HOME_WIN", "ml_home", "ml_away", "p_final_home"]).copy()
-    df["HOME_WIN"] = df["HOME_WIN"].astype(int)
+    # Diagnostics BEFORE filtering to completed games
+    print("\nDIAGNOSTICS")
+    print("--------------------------------------------------")
+    print(f"Pred rows: {len(preds)}")
+    print(f"Matched odds: {df['ml_home'].notna().mean():.1%} ({df['ml_home'].notna().sum()}/{len(df)})")
+    print(f"Matched results (completed games): {df['HOME_WIN'].notna().mean():.1%} ({df['HOME_WIN'].notna().sum()}/{len(df)})")
 
-    # Decide bet side based on edge
-    df["p_final_home"] = df["p_final_home"].astype(float)
-    df["p_market_home"] = df["p_market_home"].astype(float)
+    # Show top candidates even if results missing (so you can act today)
+    tmp = df.dropna(subset=["ml_home", "ml_away", "p_final_home"]).copy()
+    if not tmp.empty:
+        tmp["dec_home"] = tmp["ml_home"].apply(american_to_decimal)
+        tmp["dec_away"] = tmp["ml_away"].apply(american_to_decimal)
+        tmp["p_home"] = tmp["p_final_home"].astype(float)
+        tmp["p_away"] = 1.0 - tmp["p_home"]
 
-    df["edge"] = df["p_final_home"] - df["p_market_home"]
-    df["bet_home"] = (df["edge"] >= EDGE_THRESHOLD).astype(int)
+        tmp["ev_home"] = tmp.apply(lambda r: ev_per_1u(r["p_home"], r["dec_home"]), axis=1)
+        tmp["ev_away"] = tmp.apply(lambda r: ev_per_1u(r["p_away"], r["dec_away"]), axis=1)
 
-    # Also allow betting away if strongly negative (optional)
-    # If you want BOTH sides, uncomment:
-    # df["bet_away"] = (df["edge"] <= -EDGE_THRESHOLD).astype(int)
-    # For now: only home-side bets to keep it simple
-    df = df[df["bet_home"] == 1].copy()
+        # Pick best side by EV
+        tmp["side"] = np.where(tmp["ev_home"] >= tmp["ev_away"], "HOME", "AWAY")
+        tmp["ev_best"] = np.where(tmp["side"] == "HOME", tmp["ev_home"], tmp["ev_away"])
 
-    if df.empty:
-        print("No bets triggered. Lower EDGE_THRESHOLD or gather more days.")
+        print("\nTOP TODAY (by EV, even if not finished yet)")
+        print("--------------------------------------------------")
+        show = tmp.sort_values("ev_best", ascending=False).head(PRINT_TOP)
+        for _, r in show.iterrows():
+            matchup = f"{r['away']} @ {r['home']}"
+            side = r["side"]
+            evb = r["ev_best"]
+            p = r["p_home"] if side == "HOME" else (1.0 - r["p_home"])
+            ml = r["ml_home"] if side == "HOME" else r["ml_away"]
+            print(f"{matchup} | bet {side} | p={p:.3f} | ml={ml:.0f} | EV={evb:+.3f}")
+    else:
+        print("\nNo rows with odds + p_final yet to score EV.")
+
+    # Now filter to completed games for true backtest
+    bt = df.dropna(subset=["HOME_WIN", "ml_home", "ml_away", "p_final_home"]).copy()
+    if bt.empty:
+        print("\nBACKTEST")
+        print("--------------------------------------------------")
+        print("No completed games with (odds + prediction + result) yet.")
+        print("Run this again after games finish AND after you update your games.parquet ingestion.")
         raise SystemExit
 
-    # Compute payout / EV / realized
-    df["dec_home"] = df["ml_home"].apply(american_to_decimal)
-    df["win_profit_per_unit"] = df["dec_home"].apply(profit_per_unit_stake_from_decimal)
-    df["p"] = df["p_final_home"]
+    bt["HOME_WIN"] = bt["HOME_WIN"].astype(int)
+    bt["dec_home"] = bt["ml_home"].apply(american_to_decimal)
+    bt["dec_away"] = bt["ml_away"].apply(american_to_decimal)
 
-    # Realized PnL for 1u stake on home
-    df["pnl_1u"] = np.where(df["HOME_WIN"] == 1, df["win_profit_per_unit"], -1.0)
+    bt["p_home"] = bt["p_final_home"].astype(float)
+    bt["p_away"] = 1.0 - bt["p_home"]
 
-    # Expected value (per 1u stake)
-    df["ev_1u"] = df["p"] * df["win_profit_per_unit"] - (1.0 - df["p"])
+    bt["ev_home"] = bt.apply(lambda r: ev_per_1u(r["p_home"], r["dec_home"]), axis=1)
+    bt["ev_away"] = bt.apply(lambda r: ev_per_1u(r["p_away"], r["dec_away"]), axis=1)
 
-    # Kelly sizing (fraction of bankroll)
-    df["kelly_f"] = df.apply(lambda r: kelly_fraction(r["p"], r["dec_home"]), axis=1)
-    df["stake_kelly"] = (KELLY_MULT * df["kelly_f"]).clip(lower=MIN_KELLY, upper=MAX_KELLY)
+    # Choose best side per game, bet only if EV >= MIN_EV
+    bt["side"] = np.where(bt["ev_home"] >= bt["ev_away"], "HOME", "AWAY")
+    bt["ev_best"] = np.where(bt["side"] == "HOME", bt["ev_home"], bt["ev_away"])
+    bt = bt[bt["ev_best"] >= MIN_EV].copy()
 
-    # Simulate bankroll over time (sort chronologically)
-    df["date_dt"] = pd.to_datetime(df["date"])
-    df = df.sort_values(["date_dt", "game_id"]).reset_index(drop=True)
-
-    bankroll_flat = START_BANKROLL
-    bankroll_kelly = START_BANKROLL
-    eq_flat = []
-    eq_kelly = []
-
-    for _, r in df.iterrows():
-        # flat: 1 unit stake
-        bankroll_flat += r["pnl_1u"]
-        eq_flat.append(bankroll_flat)
-
-        # kelly: stake as fraction of bankroll
-        stake = bankroll_kelly * float(r["stake_kelly"])
-        pnl = stake * (r["win_profit_per_unit"] if r["HOME_WIN"] == 1 else -1.0)
-        bankroll_kelly += pnl
-        eq_kelly.append(bankroll_kelly)
-
-    df["bankroll_flat"] = eq_flat
-    df["bankroll_kelly"] = eq_kelly
-
-    # Metrics
-    n_bets = len(df)
-    win_rate = df["HOME_WIN"].mean()
-    roi_flat = (df["pnl_1u"].sum() / n_bets)  # per bet units
-    total_units = df["pnl_1u"].sum()
-    avg_ev = df["ev_1u"].mean()
-    avg_edge = df["edge"].mean()
-
-    # Max drawdown (flat)
-    peak = np.maximum.accumulate(df["bankroll_flat"].values)
-    dd = (df["bankroll_flat"].values - peak)
-    max_dd_flat = dd.min()
-
-    # Max drawdown (kelly)
-    peakk = np.maximum.accumulate(df["bankroll_kelly"].values)
-    ddk = (df["bankroll_kelly"].values - peakk)
-    max_dd_kelly = ddk.min()
-
-    print("\nBACKTEST (home bets only)")
+    print("\nBACKTEST")
     print("--------------------------------------------------")
-    print(f"Bets: {n_bets}")
+    if bt.empty:
+        print(f"No bets triggered at MIN_EV={MIN_EV:.2f}. Lower MIN_EV or gather more days.")
+        raise SystemExit
+
+    # Realized pnl for chosen side
+    bt["win_side"] = np.where(bt["side"] == "HOME", bt["HOME_WIN"], 1 - bt["HOME_WIN"])
+    bt["dec_side"] = np.where(bt["side"] == "HOME", bt["dec_home"], bt["dec_away"])
+    bt["pnl_1u"] = bt.apply(lambda r: pnl_per_1u(int(r["win_side"]), float(r["dec_side"])), axis=1)
+
+    n = len(bt)
+    total_units = float(bt["pnl_1u"].sum())
+    roi_per_bet = total_units / n
+    win_rate = float(bt["win_side"].mean())
+    avg_ev = float(bt["ev_best"].mean())
+
+    print(f"Bets: {n}")
     print(f"Win rate: {win_rate:.3f}")
-    print(f"Avg edge (p_final - p_mkt): {avg_edge:.3f}")
-    print(f"Avg EV (per 1u): {avg_ev:.3f}")
-    print("---- Flat (1u) ----")
-    print(f"Total units: {total_units:.2f}")
-    print(f"ROI per bet: {roi_flat:.3f}")
-    print(f"Max drawdown (units): {max_dd_flat:.2f}")
-    print("---- Kelly (fractional) ----")
-    print(f"Start bankroll: {START_BANKROLL:.2f}")
-    print(f"End bankroll:   {df['bankroll_kelly'].iloc[-1]:.2f}")
-    print(f"Max drawdown ($): {max_dd_kelly:.2f}")
+    print(f"Avg EV (per 1u): {avg_ev:+.3f}")
+    print(f"Total units: {total_units:+.2f}")
+    print(f"ROI per bet: {roi_per_bet:+.3f}")
 
     out_path = "data/processed/backtest_results.csv"
-    df.to_csv(out_path, index=False)
-    print("--------------------------------------------------")
-    print(f"Saved detailed results: {out_path}")
+    bt.to_csv(out_path, index=False)
+    print(f"Saved: {out_path}")
