@@ -8,7 +8,6 @@ from sklearn.metrics import log_loss, brier_score_loss, accuracy_score
 def elo_expected(r_a, r_b):
     return 1.0 / (1.0 + 10 ** ((r_b - r_a) / 400.0))
 
-# ---------------- Main ----------------
 if __name__ == "__main__":
     MODEL_PATH = "models/win_model_v2.joblib"  # change if needed
     GAMES_PATH = "data/processed/games.parquet"
