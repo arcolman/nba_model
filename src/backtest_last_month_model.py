@@ -4,7 +4,7 @@ from collections import defaultdict, deque
 from joblib import load
 from sklearn.metrics import log_loss, brier_score_loss, accuracy_score
 
-# ---------------- Elo ----------------
+
 def elo_expected(r_a, r_b):
     return 1.0 / (1.0 + 10 ** ((r_b - r_a) / 400.0))
 
@@ -13,21 +13,17 @@ if __name__ == "__main__":
     GAMES_PATH = "data/processed/games.parquet"
     TEAM_GAMES_PATH = "data/raw/team_games.parquet"
 
-    # Elo hyperparams (should match your features_elo.py)
     K = 20.0
     HOME_ADV = 65.0
     BASE = 1500.0
 
-    # Rolling form windows
     W5 = 5
     W10 = 10
 
-    # Load model bundle
     bundle = load(MODEL_PATH)
     model = bundle["model"]
     feature_cols = bundle["feature_cols"]
 
-    # Load data
     games = pd.read_parquet(GAMES_PATH).copy()
     team_games = pd.read_parquet(TEAM_GAMES_PATH).copy()
 
